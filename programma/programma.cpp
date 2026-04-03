@@ -1,4 +1,4 @@
-﻿#define _CRT_SECURE_NO_WARNINGS  // Отключаем предупреждение MSVC
+﻿#define _CRT_SECURE_NO_WARNINGS
 #include <iostream>
 #include <filesystem>
 #include <vector>
@@ -279,7 +279,7 @@ private:
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
-    //SetConsoleOutputCP(65001);  // UTF-8
+
     setlocale(LC_ALL, "Russian");
     SetConsoleCP(65001);
 #endif
