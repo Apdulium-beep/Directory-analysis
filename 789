@@ -1,0 +1,228 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <iostream>
+#include <filesystem>
+#include <vector>
+#include <iomanip>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <thread>
+#include <atomic>
+
+namespace fs = std::filesystem;
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+struct FolderData {
+    std::string path;
+    uintmax_t file_count;
+    uintmax_t size_bits;      // размер в битах
+};
+
+class DirectoryAnalyzer {
+private:
+    std::vector<FolderData> folders;
+    std::atomic<bool> scanning{ true };
+
+    // Форматирование размера в битах с единицами (бит, Кбит, Мбит...)
+    std::string format_size_bits(uintmax_t bits) {
+        const char* units[] = { "бит", "Кбит", "Мбит", "Гбит", "Тбит", "Пбит" };
+        double size = static_cast<double>(bits);
+        int unit_idx = 0;
+        while (size >= 1024.0 && unit_idx < 5) {
+            size /= 1024.0;
+            unit_idx++;
+        }
+        char buffer[32];
+#ifdef _MSC_VER
+        sprintf_s(buffer, sizeof(buffer), "%.1f %s", size, units[unit_idx]);
+#else
+        sprintf(buffer, "%.1f %s", size, units[unit_idx]);
+#endif
+        return std::string(buffer);
+    }
+
+    uintmax_t count_files_in_folder(const fs::path& folder_path) {
+        uintmax_t count = 0;
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                folder_path, fs::directory_options::skip_permission_denied)) {
+                if (fs::is_regular_file(entry)) ++count;
+            }
+        } catch (const std::exception&) {}
+        return count;
+    }
+
+    uintmax_t calculate_folder_size_bytes(const fs::path& folder_path) {
+        uintmax_t total = 0;
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                folder_path, fs::directory_options::skip_permission_denied)) {
+                if (fs::is_regular_file(entry)) total += fs::file_size(entry);
+            }
+        } catch (const std::exception&) {}
+        return total;
+    }
+
+    void collect_folders(const fs::path& current_path) {
+        try {
+            if (!fs::is_directory(current_path)) return;
+            uintmax_t bytes = calculate_folder_size_bytes(current_path);
+            folders.push_back({ current_path.string(),
+                                count_files_in_folder(current_path),
+                                bytes * 8 });   // переводим в биты
+
+            std::vector<fs::path> subdirs;
+            for (const auto& entry : fs::directory_iterator(current_path))
+                if (fs::is_directory(entry))
+                    subdirs.push_back(entry.path());
+            std::sort(subdirs.begin(), subdirs.end());
+            for (const auto& sub : subdirs) collect_folders(sub);
+        } catch (const std::exception&) {}
+    }
+
+public:
+    void analyze(const fs::path& root) {
+        std::cout << "Сканирование папок: " << root << std::endl;
+        scanning = true;
+        auto start = std::chrono::high_resolution_clock::now();
+
+        std::thread animation([this]() {
+            const char anim[] = "|/-\\";
+            int i = 0;
+            while (scanning) {
+                std::cout << "\rЗагрузка... " << anim[i % 4] << "   " << std::flush;
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                ++i;
+            }
+            std::cout << "\r" << std::string(20, ' ') << "\r" << std::flush;
+        });
+
+        folders.clear();
+        collect_folders(root);
+        scanning = false;
+        animation.join();
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        std::cout << "Найдено папок: " << folders.size() << " за " << ms << " ms\n";
+    }
+
+    void save_to_file(const std::string& filename) {
+        if (folders.empty()) {
+            std::cerr << "Нет данных для сохранения.\n";
+            return;
+        }
+
+        // Вычисляем максимальную ширину столбцов
+        size_t max_path = 4, max_files = 10, max_size = 6;
+        for (const auto& f : folders) {
+            max_path = std::max(max_path, f.path.length());
+            max_files = std::max(max_files, std::to_string(f.file_count).length());
+            std::string size_str = format_size_bits(f.size_bits);
+            max_size = std::max(max_size, size_str.length());
+        }
+
+        const int padding = 2;
+        int w1 = static_cast<int>(max_path) + padding * 2;
+        int w2 = static_cast<int>(max_files) + padding * 2;
+        int w3 = static_cast<int>(max_size) + padding * 2;
+
+        auto line = [&](char left, char mid, char right, char fill) {
+            return std::string(1, left) + std::string(w1, fill) + mid +
+                   std::string(w2, fill) + mid + std::string(w3, fill) + right;
+        };
+
+        std::string out_name = filename;
+        if (out_name.find(".txt") == std::string::npos &&
+            out_name.find(".TXT") == std::string::npos)
+            out_name += ".txt";
+
+        std::ofstream out(out_name);
+        if (!out) {
+            std::cerr << "Ошибка: не удалось создать файл " << out_name << std::endl;
+            return;
+        }
+
+        // Верхняя граница
+        out << line('+', '+', '+', '-') << "\n";
+        // Заголовки
+        out << "| " << std::left << std::setw(w1 - 2) << "Путь"
+            << "| " << std::left << std::setw(w2 - 2) << "Количество файлов"
+            << "| " << std::left << std::setw(w3 - 2) << "Размер (бит)"
+            << "|\n";
+        out << line('+', '+', '+', '-') << "\n";
+
+        // Данные с разделителями между строками
+        for (size_t i = 0; i < folders.size(); ++i) {
+            const auto& f = folders[i];
+            out << "| " << std::left << std::setw(w1 - 2) << f.path
+                << "| " << std::right << std::setw(w2 - 2) << f.file_count
+                << "| " << std::right << std::setw(w3 - 2) << format_size_bits(f.size_bits)
+                << "|\n";
+            if (i != folders.size() - 1) {
+                out << line('+', '+', '+', '-') << "\n";
+            }
+        }
+
+        // Нижняя граница
+        out << line('+', '+', '+', '-') << "\n";
+
+        // Статистика
+        uintmax_t total_files = 0, total_bits = 0;
+        for (const auto& f : folders) {
+            total_files += f.file_count;
+            total_bits += f.size_bits;
+        }
+        out << "\nВсего папок: " << folders.size()
+            << "\nВсего файлов: " << total_files
+            << "\nОбщий размер: " << format_size_bits(total_bits) << "\n";
+
+        out.close();
+        std::cout << "Результат сохранён в файл: " << out_name << std::endl;
+    }
+};
+
+int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    setlocale(LC_ALL, "Russian");
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
+#endif
+
+    std::cout << "Анализатор папок (только папки) – размер в БИТАХ\n";
+    std::cout << "===============================================\n";
+
+    fs::path target_path;
+    if (argc > 1) {
+        target_path = argv[1];
+    } else {
+        std::cout << "Введите путь к папке для анализа (Enter = текущая): ";
+        std::string input;
+        std::getline(std::cin, input);
+        target_path = input.empty() ? fs::current_path() : input;
+    }
+
+    if (!fs::exists(target_path) || !fs::is_directory(target_path)) {
+        std::cerr << "Ошибка: папка не существует или не является директорией.\n";
+        return 1;
+    }
+
+    DirectoryAnalyzer analyzer;
+    analyzer.analyze(target_path);
+
+    std::cout << "Введите имя выходного файла (без расширения, будет добавлено .txt): ";
+    std::string out_filename;
+    std::getline(std::cin, out_filename);
+    if (out_filename.empty()) out_filename = "report";
+
+    analyzer.save_to_file(out_filename);
+
+    std::cout << "Готово. Нажмите Enter для выхода...";
+    std::cin.get();
+    return 0;
+}
