@@ -1,0 +1,195 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <iostream>
+#include <filesystem>
+#include <vector>
+#include <iomanip>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <thread>
+#include <atomic>
+
+namespace fs = std::filesystem;
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
+struct FolderData {
+    std::string path;
+    uintmax_t file_count;
+    uintmax_t size;
+};
+
+class DirectoryAnalyzer {
+private:
+    std::vector<FolderData> folders;
+    std::atomic<bool> scanning{ true };
+
+    std::string get_size_string(uintmax_t size_bytes) {
+        const char* units[] = { "B", "KB", "MB", "GB", "TB", "PB" };
+        double size = static_cast<double>(size_bytes);
+        int unit_idx = 0;
+        while (size >= 1024.0 && unit_idx < 5) {
+            size /= 1024.0;
+            unit_idx++;
+        }
+        char buffer[32];
+#ifdef _MSC_VER
+        sprintf_s(buffer, sizeof(buffer), "%.1f %s", size, units[unit_idx]);
+#else
+        sprintf(buffer, "%.1f %s", size, units[unit_idx]);
+#endif
+        return std::string(buffer);
+    }
+
+    uintmax_t count_files_in_folder(const fs::path& folder_path) {
+        uintmax_t count = 0;
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                folder_path, fs::directory_options::skip_permission_denied)) {
+                if (fs::is_regular_file(entry)) ++count;
+            }
+        } catch (const std::exception&) {}
+        return count;
+    }
+
+    uintmax_t calculate_folder_size(const fs::path& folder_path) {
+        uintmax_t total = 0;
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                folder_path, fs::directory_options::skip_permission_denied)) {
+                if (fs::is_regular_file(entry)) total += fs::file_size(entry);
+            }
+        } catch (const std::exception&) {}
+        return total;
+    }
+
+    void collect_folders(const fs::path& current_path) {
+        try {
+            if (!fs::is_directory(current_path)) return;
+            folders.push_back({ current_path.string(),
+                                count_files_in_folder(current_path),
+                                calculate_folder_size(current_path) });
+
+            std::vector<fs::path> subdirs;
+            for (const auto& entry : fs::directory_iterator(current_path))
+                if (fs::is_directory(entry))
+                    subdirs.push_back(entry.path());
+            std::sort(subdirs.begin(), subdirs.end());
+            for (const auto& sub : subdirs) collect_folders(sub);
+        } catch (const std::exception&) {}
+    }
+
+public:
+    void analyze(const fs::path& root) {
+        std::cout << "Сканирование папок: " << root << std::endl;
+        scanning = true;
+        auto start = std::chrono::high_resolution_clock::now();
+
+        std::thread animation([this]() {
+            const char anim[] = "|/-\\";
+            int i = 0;
+            while (scanning) {
+                std::cout << "\rЗагрузка... " << anim[i % 4] << "   " << std::flush;
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                ++i;
+            }
+            std::cout << "\r" << std::string(20, ' ') << "\r" << std::flush;
+        });
+
+        folders.clear();
+        collect_folders(root);
+        scanning = false;
+        animation.join();
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        std::cout << "Найдено папок: " << folders.size() << " за " << ms << " ms\n";
+    }
+
+    // Сохранение в CSV (открывается в Excel)
+    void save_to_csv(const std::string& filename) {
+        if (folders.empty()) {
+            std::cerr << "Нет данных для сохранения.\n";
+            return;
+        }
+
+        std::string out_name = filename;
+        if (out_name.find(".csv") == std::string::npos &&
+            out_name.find(".CSV") == std::string::npos)
+            out_name += ".csv";
+
+        std::ofstream out(out_name);
+        if (!out) {
+            std::cerr << "Ошибка: не удалось создать файл " << out_name << std::endl;
+            return;
+        }
+
+        // Заголовки (разделитель точка с запятой для русской Excel)
+        out << "Путь;Количество файлов;Размер\n";
+
+        // Данные по папкам (каждая строка - одна папка)
+        for (const auto& f : folders) {
+            out << "\"" << f.path << "\";"      // путь в кавычках на случай запятых
+                << f.file_count << ";"
+                << get_size_string(f.size) << "\n";
+        }
+
+        // Итоговая статистика (добавим вниз, отделив пустой строкой)
+        uintmax_t total_files = 0, total_size = 0;
+        for (const auto& f : folders) {
+            total_files += f.file_count;
+            total_size += f.size;
+        }
+        out << "\n\"Всего папок:\";" << folders.size() << ";\n";
+        out << "\"Всего файлов:\";" << total_files << ";\n";
+        out << "\"Общий размер:\";\"" << get_size_string(total_size) << "\";\n";
+
+        out.close();
+        std::cout << "Результат сохранён в CSV-файл: " << out_name << std::endl;
+        std::cout << "Этот файл можно открыть в Excel двойным щелчком.\n";
+    }
+};
+
+int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    setlocale(LC_ALL, "Russian");
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
+#endif
+
+    std::cout << "Анализатор папок (только папки) с выводом в CSV (Excel)\n";
+    std::cout << "=======================================================\n";
+
+    fs::path target_path;
+    if (argc > 1) {
+        target_path = argv[1];
+    } else {
+        std::cout << "Введите путь к папке для анализа (Enter = текущая): ";
+        std::string input;
+        std::getline(std::cin, input);
+        target_path = input.empty() ? fs::current_path() : input;
+    }
+
+    if (!fs::exists(target_path) || !fs::is_directory(target_path)) {
+        std::cerr << "Ошибка: папка не существует или не является директорией.\n";
+        return 1;
+    }
+
+    DirectoryAnalyzer analyzer;
+    analyzer.analyze(target_path);
+
+    std::cout << "Введите имя выходного файла (без расширения, будет добавлено .csv): ";
+    std::string out_filename;
+    std::getline(std::cin, out_filename);
+    if (out_filename.empty()) out_filename = "report";
+
+    analyzer.save_to_csv(out_filename);
+
+    std::cout << "Готово. Нажмите Enter для выхода...";
+    std::cin.get();
+    return 0;
+}
