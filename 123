@@ -1,0 +1,290 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <iostream>
+#include <filesystem>
+#include <vector>
+#include <unordered_map>
+#include <iomanip>
+#include <string>
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+
+namespace fs = std::filesystem;
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+class DirectoryAnalyzer {
+private:
+    struct FolderInfo {
+        std::string hierarchy;
+        std::string name;
+        std::string path;
+        uintmax_t total_size;
+        int file_count;
+        int folder_count;
+    };
+
+    std::vector<FolderInfo> folders_data;
+
+    std::string get_size_string(uintmax_t size_bytes) {
+        const char* units[] = { "B", "KB", "MB", "GB", "TB", "PB" };
+        double size = static_cast<double>(size_bytes);
+        int unit_idx = 0;
+
+        while (size >= 1024.0 && unit_idx < 5) {
+            size /= 1024.0;
+            unit_idx++;
+        }
+
+        char buffer[32];
+#ifdef _MSC_VER
+        sprintf_s(buffer, sizeof(buffer), "%.1f %s", size, units[unit_idx]);
+#else
+        sprintf(buffer, "%.1f %s", size, units[unit_idx]);
+#endif
+        return std::string(buffer);
+    }
+
+    std::string get_hierarchy_symbol(int level) {
+        if (level == 0) return "";
+
+        std::string symbols;
+        for (int i = 0; i < level - 1; ++i) {
+            symbols += "|   ";
+        }
+        symbols += "+-- ";
+        return symbols;
+    }
+
+    uintmax_t calculate_folder_size(const fs::path& folder_path) {
+        uintmax_t total_size = 0;
+        
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                folder_path, fs::directory_options::skip_permission_denied)) {
+                if (fs::is_regular_file(entry)) {
+                    total_size += fs::file_size(entry);
+                }
+            }
+        }
+        catch (const std::exception&) {
+            // Игнорируем ошибки доступа
+        }
+        
+        return total_size;
+    }
+
+    int count_files_in_folder(const fs::path& folder_path) {
+        int file_count = 0;
+        
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(
+                folder_path, fs::directory_options::skip_permission_denied)) {
+                if (fs::is_regular_file(entry)) {
+                    file_count++;
+                }
+            }
+        }
+        catch (const std::exception&) {
+            // Игнорируем ошибки доступа
+        }
+        
+        return file_count;
+    }
+
+    int count_subfolders(const fs::path& folder_path) {
+        int folder_count = 0;
+        
+        try {
+            for (const auto& entry : fs::directory_iterator(folder_path)) {
+                if (fs::is_directory(entry)) {
+                    folder_count++;
+                }
+            }
+        }
+        catch (const std::exception&) {
+            // Игнорируем ошибки доступа
+        }
+        
+        return folder_count;
+    }
+
+public:
+    void analyze_directory(const fs::path& root_path) {
+        std::cout << "Сканирование папок: " << root_path << std::endl;
+        auto start_time = std::chrono::high_resolution_clock::now();
+
+        folders_data.clear();
+        
+        recursive_analyze_folders(root_path, 0);
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+
+        print_results(duration.count());
+    }
+
+private:
+    void recursive_analyze_folders(const fs::path& path_obj, int level) {
+        try {
+            if (!fs::exists(path_obj)) {
+                return;
+            }
+
+            if (fs::is_directory(path_obj)) {
+                try {
+                    // Получаем информацию о папке
+                    uintmax_t total_size = calculate_folder_size(path_obj);
+                    int file_count = count_files_in_folder(path_obj);
+                    int folder_count = count_subfolders(path_obj);
+                    
+                    std::string hierarchy = get_hierarchy_symbol(level);
+                    
+                    folders_data.push_back({
+                        hierarchy,
+                        path_obj.filename().string(),
+                        path_obj.string(),
+                        total_size,
+                        file_count,
+                        folder_count
+                    });
+
+                    // Собираем все подпапки
+                    std::vector<fs::path> subfolders;
+                    for (const auto& entry : fs::directory_iterator(path_obj)) {
+                        if (fs::is_directory(entry)) {
+                            subfolders.push_back(entry.path());
+                        }
+                    }
+
+                    // Сортируем подпапки по имени
+                    std::sort(subfolders.begin(), subfolders.end(),
+                        [](const fs::path& a, const fs::path& b) {
+                            return a.filename().string() < b.filename().string();
+                        });
+
+                    // Рекурсивно обрабатываем каждую подпапку
+                    for (const auto& subfolder : subfolders) {
+                        recursive_analyze_folders(subfolder, level + 1);
+                    }
+                }
+                catch (const fs::filesystem_error& e) {
+                    folders_data.push_back({
+                        get_hierarchy_symbol(level) + "[ERR]",
+                        path_obj.filename().string(),
+                        "ОШИБКА ДОСТУПА",
+                        0,
+                        0,
+                        0
+                    });
+                }
+            }
+        }
+        catch (const std::exception& e) {
+            // Игнорируем ошибки
+        }
+    }
+
+    void print_results(int duration_ms) {
+        std::cout << "\n" << std::string(120, '=') << std::endl;
+        std::cout << "РЕЗУЛЬТАТ АНАЛИЗА ПАПОК" << std::endl;
+        std::cout << std::string(120, '=') << std::endl;
+
+        std::cout << std::left 
+            << std::setw(50) << "Структура папок"
+            << std::setw(20) << "Размер"
+            << std::setw(15) << "Файлов"
+            << "Подпапок" << std::endl;
+        std::cout << std::string(120, '-') << std::endl;
+
+        uintmax_t total_size = 0;
+        int total_files = 0;
+        int total_folders = 0;
+
+        for (const auto& folder : folders_data) {
+            std::string display_name = folder.hierarchy + folder.name;
+            if (display_name.empty()) display_name = "(root)";
+            
+            std::cout << std::left 
+                << std::setw(50) << (display_name.length() > 47 ? display_name.substr(0, 47) + "..." : display_name)
+                << std::setw(20) << get_size_string(folder.total_size)
+                << std::setw(15) << folder.file_count
+                << folder.folder_count << std::endl;
+
+            total_size += folder.total_size;
+            total_files += folder.file_count;
+            total_folders++;
+        }
+
+        std::cout << std::string(120, '-') << std::endl;
+        std::cout << "СТАТИСТИКА:" << std::endl;
+        std::cout << "  Всего папок: " << total_folders << std::endl;
+        std::cout << "  Всего файлов: " << total_files << std::endl;
+        std::cout << "  Общий размер: " << get_size_string(total_size) << std::endl;
+        std::cout << "  Время сканирования: " << duration_ms << " ms" << std::endl;
+        std::cout << std::string(120, '=') << std::endl;
+        
+        // Дополнительная статистика по размерам папок
+        if (!folders_data.empty()) {
+            std::cout << "\nТОП-10 САМЫХ БОЛЬШИХ ПАПОК:" << std::endl;
+            std::cout << std::string(120, '-') << std::endl;
+            
+            auto sorted_folders = folders_data;
+            std::sort(sorted_folders.begin(), sorted_folders.end(),
+                [](const FolderInfo& a, const FolderInfo& b) {
+                    return a.total_size > b.total_size;
+                });
+            
+            int top_count = std::min(10, (int)sorted_folders.size());
+            for (int i = 0; i < top_count; i++) {
+                std::cout << std::setw(3) << (i + 1) << ". "
+                          << std::setw(50) << (sorted_folders[i].name.length() > 47 ? 
+                             sorted_folders[i].name.substr(0, 47) + "..." : sorted_folders[i].name)
+                          << " - " << get_size_string(sorted_folders[i].total_size) << std::endl;
+            }
+            std::cout << std::string(120, '-') << std::endl;
+        }
+    }
+};
+
+int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    setlocale(LC_ALL, "Russian");
+    SetConsoleCP(65001);
+    SetConsoleOutputCP(65001);
+#endif
+
+    std::cout << "Directory Analyzer - Анализ папок (Только папки)" << std::endl;
+    std::cout << "==================================================" << std::endl;
+
+    fs::path target_path;
+
+    if (argc > 1) {
+        target_path = argv[1];
+    }
+    else {
+        std::cout << "Введите путь к папке (Enter = текущая): ";
+        std::string input;
+        std::getline(std::cin, input);
+        target_path = input.empty() ? fs::current_path() : input;
+    }
+
+    if (!fs::exists(target_path)) {
+        std::cerr << "Ошибка: Папка не существует: " << target_path << std::endl;
+        return 1;
+    }
+
+    if (!fs::is_directory(target_path)) {
+        std::cerr << "Ошибка: Указанный путь не является папкой: " << target_path << std::endl;
+        return 1;
+    }
+
+    DirectoryAnalyzer analyzer;
+    analyzer.analyze_directory(target_path);
+
+    std::cout << "\nНажмите Enter для выхода...";
+    std::cin.get();
+    return 0;
+}
