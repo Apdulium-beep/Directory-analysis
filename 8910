@@ -1,4 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
+#define _SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
+
 #include <iostream>
 #include <filesystem>
 #include <vector>
@@ -15,14 +17,13 @@ namespace fs = std::filesystem;
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <shlobj.h>
 #endif
 
 struct FolderData {
     std::string path;
-    std::string name;
     uintmax_t file_count;
-    uintmax_t size_bits;
-    int level;
+    uintmax_t size;
 };
 
 class DirectoryAnalyzer {
@@ -30,21 +31,9 @@ private:
     std::vector<FolderData> folders;
     std::atomic<bool> scanning{ true };
 
-    std::string format_size_bits(uintmax_t bits) {
-        const char* units[] = { "бит", "Кбит", "Мбит", "Гбит", "Тбит", "Пбит" };
-        double size = static_cast<double>(bits);
-        int unit_idx = 0;
-        while (size >= 1024.0 && unit_idx < 5) {
-            size /= 1024.0;
-            unit_idx++;
-        }
-        char buffer[32];
-#ifdef _MSC_VER
-        sprintf_s(buffer, sizeof(buffer), "%.1f %s", size, units[unit_idx]);
-#else
-        sprintf(buffer, "%.1f %s", size, units[unit_idx]);
-#endif
-        return std::string(buffer);
+    // Получение строки с размером в байтах (без преобразования)
+    std::string get_size_string(uintmax_t size_bytes) {
+        return std::to_string(size_bytes) + " bytes";
     }
 
     uintmax_t count_files_in_folder(const fs::path& folder_path) {
@@ -54,40 +43,82 @@ private:
                 folder_path, fs::directory_options::skip_permission_denied)) {
                 if (fs::is_regular_file(entry)) ++count;
             }
-        } catch (const std::exception&) {}
+        }
+        catch (const std::exception&) {}
         return count;
     }
 
-    uintmax_t calculate_folder_size_bytes(const fs::path& folder_path) {
+    uintmax_t calculate_folder_size(const fs::path& folder_path) {
         uintmax_t total = 0;
         try {
             for (const auto& entry : fs::recursive_directory_iterator(
                 folder_path, fs::directory_options::skip_permission_denied)) {
                 if (fs::is_regular_file(entry)) total += fs::file_size(entry);
             }
-        } catch (const std::exception&) {}
+        }
+        catch (const std::exception&) {}
         return total;
     }
 
-    void collect_folders(const fs::path& current_path, int level) {
+    void collect_folders(const fs::path& current_path) {
         try {
             if (!fs::is_directory(current_path)) return;
-            uintmax_t bytes = calculate_folder_size_bytes(current_path);
             folders.push_back({ current_path.string(),
-                                current_path.filename().string(),
                                 count_files_in_folder(current_path),
-                                bytes * 8,
-                                level });
+                                calculate_folder_size(current_path) });
 
             std::vector<fs::path> subdirs;
             for (const auto& entry : fs::directory_iterator(current_path))
                 if (fs::is_directory(entry))
                     subdirs.push_back(entry.path());
             std::sort(subdirs.begin(), subdirs.end());
-            for (const auto& sub : subdirs)
-                collect_folders(sub, level + 1);
-        } catch (const std::exception&) {}
+            for (const auto& sub : subdirs) collect_folders(sub);
+        }
+        catch (const std::exception&) {}
     }
+
+#ifdef _WIN32
+    // Конвертация UTF-8 строки в wstring
+    std::wstring utf8_to_wstring(const std::string& str) {
+        if (str.empty()) return std::wstring();
+
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), NULL, 0);
+        std::wstring wstr(size_needed, 0);
+        MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), &wstr[0], size_needed);
+        return wstr;
+    }
+
+    // Конвертация wstring в UTF-8 строку
+    std::string wstring_to_utf8(const std::wstring& wstr) {
+        if (wstr.empty()) return std::string();
+
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
+        std::string str(size_needed, 0);
+        WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &str[0], size_needed, NULL, NULL);
+        return str;
+    }
+
+    // Открытие диалога выбора папки в Windows
+    std::string select_folder_dialog() {
+        BROWSEINFOW bi = { 0 };
+        bi.lpszTitle = L"Выберите директорию для сохранения отчета";
+        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+        LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+        if (pidl != 0) {
+            wchar_t path[MAX_PATH];
+            if (SHGetPathFromIDListW(pidl, path)) {
+                IMalloc* imalloc = 0;
+                if (SUCCEEDED(SHGetMalloc(&imalloc))) {
+                    imalloc->Free(pidl);
+                    imalloc->Release();
+                }
+                return wstring_to_utf8(path);
+            }
+        }
+        return "";
+    }
+#endif
 
 public:
     void analyze(const fs::path& root) {
@@ -104,10 +135,10 @@ public:
                 ++i;
             }
             std::cout << "\r" << std::string(20, ' ') << "\r" << std::flush;
-        });
+            });
 
         folders.clear();
-        collect_folders(root, 0);
+        collect_folders(root);
         scanning = false;
         animation.join();
 
@@ -116,84 +147,131 @@ public:
         std::cout << "Найдено папок: " << folders.size() << " за " << ms << " ms\n";
     }
 
-    void print_tree() {
-        std::cout << "\nДерево папок (размер в битах):\n";
-        std::cout << std::string(70, '=') << std::endl;
-        for (const auto& f : folders) {
-            std::string prefix;
-            for (int i = 0; i < f.level; ++i) {
-                if (i == f.level - 1)
-                    prefix += "+-- ";
-                else
-                    prefix += "|   ";
-            }
-            if (f.level == 0) prefix = "";
-            std::cout << prefix << f.name
-                      << "  [" << format_size_bits(f.size_bits) << ", "
-                      << f.file_count << " файлов]"
-                      << std::endl;
-        }
-        std::cout << std::string(70, '=') << std::endl;
-    }
-
+    // Сохранение в CSV с выбором директории
     void save_to_csv(const std::string& filename) {
         if (folders.empty()) {
             std::cerr << "Нет данных для сохранения.\n";
             return;
         }
 
-        std::string out_name = filename;
-        if (out_name.find(".csv") == std::string::npos &&
-            out_name.find(".CSV") == std::string::npos)
-            out_name += ".csv";
+        // Выбор директории
+        std::string save_directory;
+        std::cout << "\nВыберите способ указания директории:\n";
+        std::cout << "1 - Ввести путь вручную\n";
+        std::cout << "2 - Выбрать через диалоговое окно (Windows)\n";
+        std::cout << "Ваш выбор (1 или 2): ";
 
-        std::ofstream out(out_name);
+        int choice = 0;
+        std::cin >> choice;
+        std::cin.ignore(); // Очистка буфера
+
+        if (choice == 2) {
+#ifdef _WIN32
+            save_directory = select_folder_dialog();
+            if (save_directory.empty()) {
+                std::cout << "Директория не выбрана. Использую текущую.\n";
+                save_directory = fs::current_path().string();
+            }
+            else {
+                std::cout << "Выбрана директория: " << save_directory << std::endl;
+            }
+#else
+            std::cout << "Диалог выбора папок доступен только в Windows. Использую текущую директорию.\n";
+            save_directory = fs::current_path().string();
+#endif
+        }
+        else {
+            std::cout << "Введите путь к директории для сохранения (Enter = текущая): ";
+            std::getline(std::cin, save_directory);
+            if (save_directory.empty()) {
+                save_directory = fs::current_path().string();
+            }
+        }
+
+        // Проверка и создание директории
+        fs::path save_path(save_directory);
+        if (!fs::exists(save_path)) {
+            std::cout << "Директория не существует. Создаю: " << save_directory << std::endl;
+            try {
+                fs::create_directories(save_path);
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Ошибка создания директории: " << e.what() << std::endl;
+                return;
+            }
+        }
+
+        // Формирование полного пути к файлу
+        fs::path full_path = save_path / (filename + ".csv");
+
+        std::ofstream out(full_path);
         if (!out) {
-            std::cerr << "Ошибка: не удалось создать файл " << out_name << std::endl;
+            std::cerr << "Ошибка: не удалось создать файл " << full_path << std::endl;
             return;
         }
 
-        // Заголовки (разделитель точка с запятой)
-        out << "Путь;Количество файлов;Размер (бит);Размер (читаемый)\n";
+        // Заголовки (разделитель точка с запятой для русской Excel)
+        out << "Путь;Количество файлов;Размер (байты)\n";
 
-        // Данные
+        // Данные по папкам (каждая строка - одна папка)
         for (const auto& f : folders) {
-            out << "\"" << f.path << "\";"
+            out << "\"" << f.path << "\";"      // путь в кавычках на случай запятых
                 << f.file_count << ";"
-                << f.size_bits << ";"
-                << "\"" << format_size_bits(f.size_bits) << "\"\n";
+                << f.size << "\n";               // размер в байтах
         }
 
-        // Статистика
-        uintmax_t total_files = 0, total_bits = 0;
+        // Итоговая статистика
+        uintmax_t total_files = 0, total_size = 0;
         for (const auto& f : folders) {
             total_files += f.file_count;
-            total_bits += f.size_bits;
+            total_size += f.size;
         }
-        out << "\n\"Всего папок:\";" << folders.size() << ";;\n";
-        out << "\"Всего файлов:\";" << total_files << ";;\n";
-        out << "\"Общий размер:\";" << total_bits << ";\"" << format_size_bits(total_bits) << "\"\n";
+
+        out << "\n\"Всего папок:\";" << folders.size() << ";\n";
+        out << "\"Всего файлов:\";" << total_files << ";\n";
+        out << "\"Общий размер (байты):\";" << total_size << ";\n";
+
+        // Дополнительная информация для удобства
+        out << "\"Общий размер (килобайты):\";" << std::fixed << std::setprecision(2) << (total_size / 1024.0) << ";\n";
+        out << "\"Общий размер (мегабайты):\";" << std::fixed << std::setprecision(2) << (total_size / (1024.0 * 1024.0)) << ";\n";
+        out << "\"Общий размер (гигабайты):\";" << std::fixed << std::setprecision(2) << (total_size / (1024.0 * 1024.0 * 1024.0)) << ";\n";
 
         out.close();
-        std::cout << "Результат сохранён в CSV-файл: " << out_name << std::endl;
-        std::cout << "Этот файл можно открыть в Excel двойным щелчком.\n";
+        std::cout << "\nРезультат сохранён в CSV-файл: " << full_path << std::endl;
+        std::cout << "Размеры указаны в байтах.\n";
+        std::cout << "Файл можно открыть в Excel двойным щелчком.\n";
     }
 };
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
-    setlocale(LC_ALL, "Russian");
-    SetConsoleCP(65001);
-    SetConsoleOutputCP(65001);
+    // Настройка консоли для работы с UTF-8
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
 #endif
-
-    std::cout << "Анализатор папок (только папки) – размер в БИТАХ\n";
-    std::cout << "===============================================\n";
+    setlocale(LC_ALL, "Russian");
+    std::cout << "Анализатор папок (только папки) с выводом в CSV (Excel)\n";
+    std::cout << "=======================================================\n\n";
 
     fs::path target_path;
     if (argc > 1) {
+        // Преобразование аргумента командной строки из ANSI в UTF-8
+#ifdef _WIN32
+        int argc_w;
+        LPWSTR* argv_w = CommandLineToArgvW(GetCommandLineW(), &argc_w);
+        if (argv_w && argc_w > 1) {
+            std::wstring wpath(argv_w[1]);
+            target_path = fs::path(wpath);
+            LocalFree(argv_w);
+        }
+        else {
+            target_path = argv[1];
+        }
+#else
         target_path = argv[1];
-    } else {
+#endif
+    }
+    else {
         std::cout << "Введите путь к папке для анализа (Enter = текущая): ";
         std::string input;
         std::getline(std::cin, input);
@@ -202,27 +280,21 @@ int main(int argc, char* argv[]) {
 
     if (!fs::exists(target_path) || !fs::is_directory(target_path)) {
         std::cerr << "Ошибка: папка не существует или не является директорией.\n";
+        std::cerr << "Путь: " << target_path << std::endl;
         return 1;
     }
 
     DirectoryAnalyzer analyzer;
     analyzer.analyze(target_path);
-    analyzer.print_tree();
 
-    std::cout << "\nСохранить результат в Excel (CSV)? (y/n): ";
-    char answer;
-    std::cin >> answer;
-    if (answer == 'y' || answer == 'Y') {
-        std::cin.ignore();
-        std::cout << "Введите имя файла (без расширения): ";
-        std::string out_name;
-        std::getline(std::cin, out_name);
-        if (out_name.empty()) out_name = "report";
-        analyzer.save_to_csv(out_name);
-    }
+    std::cout << "\nВведите имя выходного файла (без расширения): ";
+    std::string out_filename;
+    std::getline(std::cin, out_filename);
+    if (out_filename.empty()) out_filename = "report";
 
-    std::cout << "\nНажмите Enter для выхода...";
-    std::cin.ignore();
+    analyzer.save_to_csv(out_filename);
+
+    std::cout << "\nГотово. Нажмите Enter для выхода...";
     std::cin.get();
     return 0;
 }
